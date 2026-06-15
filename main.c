@@ -15,6 +15,20 @@
 #define RED_LED   PORTAbits.RA1
 #define LCD_RS    PORTCbits.RC0
 #define LCD_E     PORTDbits.RD0
+#define RC522_CS  PORTCbits.RC2
+#define RC522_RST PORTBbits.RB1
+
+#define CommandReg       0x01
+#define ModeReg          0x11
+#define TxControlReg     0x14
+#define TxASKReg         0x15
+#define TModeReg         0x2A
+#define TPrescalerReg    0x2B
+#define TReloadRegH      0x2C
+#define TReloadRegL      0x2D
+#define VersionReg       0x37
+
+#define PCD_RESETPHASE   0x0F
 
 void set_leds(unsigned char greenValue, unsigned char redValue)
 {
@@ -56,15 +70,32 @@ void initialize_ports(void)
 {
     ADCON1 = 0b00000110;
 
-    TRISA = 0b11111100;    // RA0 and RA1 output
-    TRISB = 0b11111111;
-    TRISC = 0b11111110;    // RC0 output
+    TRISA = 0b11111100;    // RA0, RA1 output
+    TRISB = 0b11111101;    // RB1 output
+    TRISC = 0b10010000;    // RC7 RX input, RC4 MISO input
     TRISD = 0b00000000;    // LCD output
 
     PORTA = 0x00;
     PORTB = 0x00;
     PORTC = 0x00;
     PORTD = 0x00;
+}
+
+void initialize_uart(void)
+{
+    SPBRG = 129;
+    TXSTA = 0b00100100;
+    RCSTA = 0b10010000;
+}
+
+void uart_print(const char *text)
+{
+    while(*text)
+    {
+        while(!TXSTAbits.TRMT);
+        TXREG = *text;
+        text++;
+    }
 }
 
 void lcd_pulse_enable(void)
@@ -162,27 +193,142 @@ void initialize_lcd(void)
     lcd_clear();
 }
 
+unsigned char spi_transfer(unsigned char data)
+{
+    SSPBUF = data;
+
+    while(!SSPSTATbits.BF);
+
+    return SSPBUF;
+}
+
+void initialize_spi(void)
+{
+    RC522_CS = 1;
+
+    SSPSTAT = 0b01000000;
+    SSPCON = 0b00100010;
+}
+
+void rc522_write(unsigned char address, unsigned char value)
+{
+    RC522_CS = 0;
+
+    spi_transfer((address << 1) & 0x7E);
+    spi_transfer(value);
+
+    RC522_CS = 1;
+}
+
+unsigned char rc522_read(unsigned char address)
+{
+    unsigned char value;
+
+    RC522_CS = 0;
+
+    spi_transfer(((address << 1) & 0x7E) | 0x80);
+    value = spi_transfer(0x00);
+
+    RC522_CS = 1;
+
+    return value;
+}
+
+void rc522_change_bits(unsigned char address, unsigned char mask, unsigned char setBits)
+{
+    unsigned char value;
+
+    value = rc522_read(address);
+
+    if(setBits)
+    {
+        value = value | mask;
+    }
+    else
+    {
+        value = value & ((unsigned char)(~mask));
+    }
+
+    rc522_write(address, value);
+}
+
+void initialize_rc522(void)
+{
+    unsigned char txControlValue;
+
+    RC522_RST = 0;
+    __delay_ms(50);
+
+    RC522_RST = 1;
+    __delay_ms(50);
+
+    rc522_write(CommandReg, PCD_RESETPHASE);
+    __delay_ms(50);
+
+    rc522_write(TModeReg, 0x8D);
+    rc522_write(TPrescalerReg, 0x3E);
+    rc522_write(TReloadRegL, 30);
+    rc522_write(TReloadRegH, 0);
+
+    rc522_write(TxASKReg, 0x40);
+    rc522_write(ModeReg, 0x3D);
+
+    txControlValue = rc522_read(TxControlReg);
+
+    if((txControlValue & 0x03) != 0x03)
+    {
+        rc522_change_bits(TxControlReg, 0x03, 1);
+    }
+}
+
+void show_reader_error_forever(void)
+{
+    lcd_show_message("RC522 ERROR", "NO SPI");
+    uart_print("RC522 ERROR\r\n");
+
+    while(1)
+    {
+        blink_led(0, 1);
+    }
+}
+
 void main(void)
 {
+    unsigned char versionValue;
+
     initialize_ports();
 
     set_leds(0, 0);
-
-    // Debug: LED test
     blink_led(1, 2);
     blink_led(0, 2);
 
     initialize_lcd();
 
-    // Debug: LCD test message
-    lcd_show_message("LCD OK", "VERSION 1");
+    lcd_show_message("LCD OK", "UART STARTING");
+    __delay_ms(1000);
+
+    initialize_uart();
+
+    // Debug: UART test message
+    uart_print("SYSTEM STARTED\r\n");
+
+    initialize_spi();
+    initialize_rc522();
+
+    versionValue = rc522_read(VersionReg);
+
+    if((versionValue == 0x00) || (versionValue == 0xFF))
+    {
+        show_reader_error_forever();
+    }
+
+    // Debug: RC522 connection test
+    lcd_show_message("RC522 OK", "VERSION 2");
+    uart_print("RC522 OK\r\n");
 
     while(1)
     {
         blink_led(1, 1);
-        __delay_ms(700);
-
-        blink_led(0, 1);
-        __delay_ms(700);
+        __delay_ms(1000);
     }
 }
