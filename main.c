@@ -12,12 +12,15 @@
 #pragma config WRT = OFF
 #pragma config CP = OFF
 
-#define GREEN_LED PORTAbits.RA0
-#define RED_LED   PORTAbits.RA1
-#define LCD_RS    PORTCbits.RC0
-#define LCD_E     PORTDbits.RD0
-#define RC522_CS  PORTCbits.RC2
-#define RC522_RST PORTBbits.RB1
+#define GREEN_LED PORTAbits.RA0          // PIC pin 2
+#define RED_LED   PORTAbits.RA1          // PIC pin 3
+#define LCD_RS    PORTCbits.RC0          // PIC pin 15
+#define LCD_E     PORTDbits.RD0          // PIC pin 19
+#define RC522_CS  PORTCbits.RC2          // PIC pin 17
+#define RC522_RST PORTBbits.RB1          // PIC pin 34
+
+// LCD R/W pin is connected directly to GND.
+// LCD D4-D7 are connected to RD4-RD7.
 
 #define CommandReg       0x01
 #define ComIEnReg        0x02
@@ -49,12 +52,33 @@
 
 #define MAX_LEN          16
 #define STUDENT_COUNT    2
+#define PRESENT_LIMIT_SECONDS 60UL
+
+// 20 MHz crystal, Timer1 internal clock, 1:8 prescaler
+// 50 ms overflow preload = 65536 - 31250 = 34286 = 0x85EE
+#define TIMER1_PRELOAD_H 0x85
+#define TIMER1_PRELOAD_L 0xEE
+
+volatile unsigned char timer1FiftyMsCounter = 0;
+volatile unsigned long systemSeconds = 0;
 
 char studentUidList[STUDENT_COUNT][9] = {
-    "88049C57",
-    "88042E81"
+    "88049C57",     // Aleyna Gener
+    "88042E81"      // Erhan Kocaoglu
 };
 
+typedef struct
+{
+    unsigned char isInside;
+    unsigned long entrySecond;
+    unsigned long totalSeconds;
+} AttendanceState;
+
+AttendanceState attendanceList[STUDENT_COUNT];
+
+// ======================================================
+// BASIC OUTPUT FUNCTIONS
+// ======================================================
 void set_leds(unsigned char greenValue, unsigned char redValue)
 {
     GREEN_LED = greenValue;
@@ -91,14 +115,18 @@ void blink_led(unsigned char greenSelected, unsigned char count)
     }
 }
 
+// ======================================================
+// PORT SETTINGS
+// ======================================================
 void initialize_ports(void)
 {
-    ADCON1 = 0b00000110;
+    ADCON1 = 0b00000110;   // analog pins are digital
 
-    TRISA = 0b11111100;
-    TRISB = 0b11111101;
-    TRISC = 0b10010000;
-    TRISD = 0b00000000;
+    // TRIS rule: 0 = output, 1 = input
+    TRISA = 0b11111100;    // RA0, RA1 output
+    TRISB = 0b11111101;    // RB1 output
+    TRISC = 0b10010000;    // RC7 RX input, RC4 MISO input, others output
+    TRISD = 0b00000000;    // LCD output
 
     PORTA = 0x00;
     PORTB = 0x00;
@@ -106,11 +134,61 @@ void initialize_ports(void)
     PORTD = 0x00;
 }
 
+// ======================================================
+// TIMER1
+// ======================================================
+void initialize_timer1(void)
+{
+    T1CON = 0b00110001;    // Timer1 ON, internal clock, 1:8 prescaler
+
+    TMR1H = TIMER1_PRELOAD_H;
+    TMR1L = TIMER1_PRELOAD_L;
+
+    PIR1bits.TMR1IF = 0;
+    PIE1bits.TMR1IE = 1;
+
+    INTCONbits.PEIE = 1;
+    INTCONbits.GIE = 1;
+}
+
+void __interrupt() isr(void)
+{
+    if(PIR1bits.TMR1IF)
+    {
+        PIR1bits.TMR1IF = 0;
+
+        TMR1H = TIMER1_PRELOAD_H;
+        TMR1L = TIMER1_PRELOAD_L;
+
+        timer1FiftyMsCounter++;
+
+        if(timer1FiftyMsCounter >= 20)
+        {
+            timer1FiftyMsCounter = 0;
+            systemSeconds++;
+        }
+    }
+}
+
+unsigned long get_seconds(void)
+{
+    unsigned long copiedSeconds;
+
+    INTCONbits.GIE = 0;
+    copiedSeconds = systemSeconds;
+    INTCONbits.GIE = 1;
+
+    return copiedSeconds;
+}
+
+// ======================================================
+// UART
+// ======================================================
 void initialize_uart(void)
 {
-    SPBRG = 129;
-    TXSTA = 0b00100100;
-    RCSTA = 0b10010000;
+    SPBRG = 129;           // 9600 baud, 20 MHz, BRGH = 1
+    TXSTA = 0b00100100;    // async, high speed, transmit enable
+    RCSTA = 0b10010000;    // serial port enable, receive enable
 }
 
 void uart_print(const char *text)
@@ -123,6 +201,47 @@ void uart_print(const char *text)
     }
 }
 
+void make_number_text(unsigned long number, char *text)
+{
+    unsigned char digitCount = 0;
+    unsigned char i;
+    char temp;
+
+    if(number == 0)
+    {
+        text[0] = '0';
+        text[1] = '\0';
+        return;
+    }
+
+    while(number > 0)
+    {
+        text[digitCount] = '0' + (number % 10);
+        number = number / 10;
+        digitCount++;
+    }
+
+    for(i = 0; i < digitCount / 2; i++)
+    {
+        temp = text[i];
+        text[i] = text[digitCount - 1 - i];
+        text[digitCount - 1 - i] = temp;
+    }
+
+    text[digitCount] = '\0';
+}
+
+void uart_print_number(unsigned long number)
+{
+    char numberText[11];
+
+    make_number_text(number, numberText);
+    uart_print(numberText);
+}
+
+// ======================================================
+// LCD - 4 BIT MODE
+// ======================================================
 void lcd_pulse_enable(void)
 {
     LCD_E = 1;
@@ -211,13 +330,16 @@ void initialize_lcd(void)
     lcd_send_nibble(0x20);
     __delay_ms(5);
 
-    lcd_send(0x28, 0);
-    lcd_send(0x0C, 0);
-    lcd_send(0x06, 0);
+    lcd_send(0x28, 0);     // 4-bit, 2-line
+    lcd_send(0x0C, 0);     // display ON, cursor OFF
+    lcd_send(0x06, 0);     // cursor moves right
 
     lcd_clear();
 }
 
+// ======================================================
+// SPI
+// ======================================================
 unsigned char spi_transfer(unsigned char data)
 {
     SSPBUF = data;
@@ -231,10 +353,13 @@ void initialize_spi(void)
 {
     RC522_CS = 1;
 
-    SSPSTAT = 0b01000000;
-    SSPCON = 0b00100010;
+    SSPSTAT = 0b01000000;  // CKE = 1, SMP = 0
+    SSPCON = 0b00100010;   // SPI master, Fosc/64, enable SSP
 }
 
+// ======================================================
+// RC522 LOW LEVEL
+// ======================================================
 void rc522_write(unsigned char address, unsigned char value)
 {
     RC522_CS = 0;
@@ -405,6 +530,9 @@ unsigned char rc522_to_card(unsigned char command,
     return status;
 }
 
+// ======================================================
+// RC522 CARD FUNCTIONS
+// ======================================================
 unsigned char rc522_request_card(unsigned char *cardBuffer)
 {
     unsigned int backBits;
@@ -461,6 +589,9 @@ unsigned char rc522_read_uid(unsigned char *uidBytes)
     return status;
 }
 
+// ======================================================
+// UID AND ATTENDANCE
+// ======================================================
 char nibble_to_hex(unsigned char value)
 {
     value = value & 0x0F;
@@ -501,41 +632,91 @@ signed char find_student_index(char *uidText)
     return -1;
 }
 
-void process_card(char *uidText)
+void process_attendance(char *uidText)
 {
     signed char studentIndex;
+    unsigned long currentSecond;
+    unsigned long visitDuration;
+    unsigned long totalDuration;
 
     studentIndex = find_student_index(uidText);
 
-    // Debug: print UID
-    uart_print("UID:");
-    uart_print(uidText);
-    uart_print("\r\n");
-
+    // Invalid card
     if(studentIndex < 0)
     {
         set_leds(0, 1);
 
         lcd_show_message("INVALID CARD", uidText);
 
-        // Debug: invalid card log
         uart_print("EVENT:INVALID,UID:");
         uart_print(uidText);
         uart_print("\r\n");
+
+        return;
+    }
+
+    currentSecond = get_seconds();
+
+    // Entry
+    if(attendanceList[studentIndex].isInside == 0)
+    {
+        attendanceList[studentIndex].isInside = 1;
+        attendanceList[studentIndex].entrySecond = currentSecond;
+
+        set_leds(1, 0);
+        lcd_show_message("CARD READ", "ENTRY");
+
+        uart_print("EVENT:ENTRY,UID:");
+        uart_print(uidText);
+        uart_print(",T:");
+        uart_print_number(currentSecond);
+        uart_print("\r\n");
+
+        return;
+    }
+
+    // Exit
+    attendanceList[studentIndex].isInside = 0;
+
+    visitDuration = currentSecond - attendanceList[studentIndex].entrySecond;
+    attendanceList[studentIndex].totalSeconds += visitDuration;
+    totalDuration = attendanceList[studentIndex].totalSeconds;
+
+    set_leds(0, 0);
+
+    if(totalDuration >= PRESENT_LIMIT_SECONDS)
+    {
+        lcd_show_message("CARD READ", "EXIT PRESENT");
     }
     else
     {
-        set_leds(1, 0);
+        lcd_show_message("CARD READ", "EXIT ABSENT");
+    }
 
-        lcd_show_message("VALID CARD", uidText);
+    uart_print("EVENT:EXIT,UID:");
+    uart_print(uidText);
 
-        // Debug: valid card log
-        uart_print("EVENT:VALID,UID:");
-        uart_print(uidText);
-        uart_print("\r\n");
+    uart_print(",DUR:");
+    uart_print_number(visitDuration);
+
+    uart_print(",TOTAL:");
+    uart_print_number(totalDuration);
+
+    uart_print(",STATUS:");
+
+    if(totalDuration >= PRESENT_LIMIT_SECONDS)
+    {
+        uart_print("PRESENT\r\n");
+    }
+    else
+    {
+        uart_print("ABSENT\r\n");
     }
 }
 
+// ======================================================
+// ERROR SCREEN
+// ======================================================
 void show_reader_error_forever(void)
 {
     lcd_show_message("RC522 ERROR", "NO SPI");
@@ -547,6 +728,9 @@ void show_reader_error_forever(void)
     }
 }
 
+// ======================================================
+// MAIN
+// ======================================================
 void main(void)
 {
     unsigned char status;
@@ -554,8 +738,9 @@ void main(void)
     unsigned char uidBytes[5];
     char uidText[9];
 
+    unsigned char cardWasPresent = 0;
     unsigned char cardReadLocked = 0;
-    unsigned char noCardCounter = 0;
+    unsigned long lastCardSecond = 0;
 
     initialize_ports();
 
@@ -569,6 +754,7 @@ void main(void)
     __delay_ms(1000);
 
     initialize_uart();
+    initialize_timer1();
 
     uart_print("SYSTEM STARTED\r\n");
 
@@ -589,20 +775,22 @@ void main(void)
 
         if(status == MI_OK)
         {
-            noCardCounter = 0;
-
             status = rc522_read_uid(uidBytes);
 
             if(status == MI_OK)
             {
                 uid_to_text(uidBytes, uidText);
+                lastCardSecond = get_seconds();
 
+                // Same card should not be read again while it stays on reader.
                 if(cardReadLocked == 0)
                 {
-                    process_card(uidText);
+                    process_attendance(uidText);
+
+                    __delay_ms(3000);
 
                     cardReadLocked = 1;
-                    __delay_ms(1500);
+                    cardWasPresent = 1;
                 }
             }
             else
@@ -611,7 +799,6 @@ void main(void)
 
                 lcd_show_message("UID READ ERROR", "");
 
-                // Debug: UID read error log
                 uart_print("EVENT:READ_ERROR\r\n");
 
                 __delay_ms(500);
@@ -621,14 +808,15 @@ void main(void)
         {
             set_leds(0, 0);
 
-            noCardCounter++;
-
-            if(noCardCounter >= 10)
+            if((cardReadLocked == 1) && ((get_seconds() - lastCardSecond) >= 2UL))
             {
                 cardReadLocked = 0;
-                noCardCounter = 0;
+            }
 
+            if(cardWasPresent == 1)
+            {
                 lcd_show_message("SCAN CARD", "WAITING...");
+                cardWasPresent = 0;
             }
         }
 
